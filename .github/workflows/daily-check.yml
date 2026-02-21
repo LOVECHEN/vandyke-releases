@@ -1,0 +1,101 @@
+name: Daily Check & Download
+on:
+  schedule:
+    - cron: '0 0 * * 1'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '强制下载（跳过版本检查）'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  # ── 阶段一：轻量版本检测 ──
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      has_new: ${{ steps.detect.outputs.has_new }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: 检测新版本
+        id: detect
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          chmod +x ./vandyke-dl-linux-amd64
+
+          if [ "$FORCE" = "true" ]; then
+            echo "⚡ 强制模式，跳过版本检查"
+            echo "has_new=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "📋 快速版本检测…"
+          OUTPUT=$(./vandyke-dl-linux-amd64 --dry-run 2>&1)
+          VERSIONS=$(echo "$OUTPUT" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort -u)
+
+          HAS_NEW=false
+          for ver in $VERSIONS; do
+            TAG="v${ver}"
+            if ! gh release view "$TAG" &>/dev/null; then
+              echo "🆕 发现新版本: ${TAG}"
+              HAS_NEW=true
+            else
+              # 检查文件是否完整（只统计该版本的文件）
+              # 版本号在文件名中可能是 9.7.1.3815 或 9.7.1-3815，转换点号为通配
+              VER_PATTERN=$(echo "$ver" | sed 's/\./[.-]/g')
+              EXPECTED=$(echo "$OUTPUT" | grep -cE "$VER_PATTERN" || echo 0)
+              ACTUAL=$(gh release view "$TAG" --json assets --jq '.assets | length' 2>/dev/null || echo 0)
+              if [ "$EXPECTED" -eq 0 ]; then
+                echo "✅ ${TAG} 已存在"
+              elif [ "$ACTUAL" -ge "$EXPECTED" ]; then
+                echo "✅ ${TAG} 已完整 (${ACTUAL} 个文件)"
+              else
+                echo "📦 ${TAG} 文件不完整 (${ACTUAL}/${EXPECTED})，需要补充"
+                HAS_NEW=true
+              fi
+            fi
+          done
+
+          echo "has_new=${HAS_NEW}" >> "$GITHUB_OUTPUT"
+          echo "检测结果: has_new=${HAS_NEW}"
+
+  # ── 阶段二：并行下载（仅在有新版本时运行）──
+  download:
+    needs: check
+    if: needs.check.outputs.has_new == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: SecureCRT (stable)
+            product: securecrt,bundle
+            channel: stable
+          - name: SecureFX (stable)
+            product: securefx
+            channel: stable
+          - name: VShell (stable)
+            product: vshell
+            channel: stable
+          - name: SecureCRT (beta)
+            product: securecrt,bundle
+            channel: beta
+          - name: SecureFX (beta)
+            product: securefx
+            channel: beta
+          - name: VShell (beta)
+            product: vshell
+            channel: beta
+    name: ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: 下载并发布
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/download-and-release.sh "${{ matrix.product }}" "${{ matrix.channel }}"
